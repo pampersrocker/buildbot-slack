@@ -8,6 +8,9 @@ from buildbot.reporters.base import ReporterBase
 from buildbot.util import httpclientservice
 from buildbot.util.logger import Logger
 from twisted.internet import defer
+from buildbot.reporters.generators.build import BuildStartEndStatusGenerator
+from buildbot.reporters.generators.buildrequest import BuildRequestGenerator
+from buildbot.reporters.message import MessageFormatterRenderable
 
 logger = Logger()
 
@@ -15,10 +18,10 @@ STATUS_EMOJIS = {
     "success": ":white_check_mark:",
     "warnings": ":meow_wow:",
     "failure": ":x:",
-    "skipped": ":slam:",
+    "skipped": ":hand:",
     "exception": ":skull:",
-    "retry": ":facepalm:",
-    "cancelled": ":slam:",
+    "retry": ":face_palm:",
+    "cancelled": ":hand:",
 }
 STATUS_COLORS = {
     "success": "#36a64f",
@@ -77,6 +80,13 @@ class SlackStatusPush(ReporterBase):
         generators=None,
         debug=None,
         verify=None,
+        codebases=None,
+        builder=None,
+        with_responsible_user=True,
+        with_branch=True,
+        with_builder=True,
+        with_repository=True,
+        extra_properties=None,
         **kwargs,
     ):
         self.debug = debug
@@ -91,6 +101,13 @@ class SlackStatusPush(ReporterBase):
         self.channel = channel
         self.username = username
         self.attachments = attachments
+        self.codebases = codebases
+        self.builder = builder
+        self.with_responsible_user = with_responsible_user
+        self.with_branch = with_branch
+        self.with_builder = with_builder
+        self.with_repository = with_repository
+        self.extra_properties = extra_properties
         self._http = yield httpclientservice.HTTPClientService.getService(
             self.master,
             self.endpoint,
@@ -100,12 +117,25 @@ class SlackStatusPush(ReporterBase):
         self.verbose = verbose
         self.project_ids = {}
 
+    def _create_default_generators(self):
+        start_formatter = MessageFormatterRenderable('Build started.')
+        end_formatter = MessageFormatterRenderable('Build done.')
+        pending_formatter = MessageFormatterRenderable('Build pending.')
+
+        return [
+            # BuildRequestGenerator(formatter=pending_formatter),
+            BuildStartEndStatusGenerator(start_formatter=start_formatter,
+                                         end_formatter=end_formatter)
+        ]
+
     @defer.inlineCallbacks
     def getAttachments(self, build):
         sourcestamps = build["buildset"]["sourcestamps"]
         attachments = []
 
         for sourcestamp in sourcestamps:
+            if self.codebases != None and sourcestamp["codebase"] not in self.codebases:
+                continue
             sha = sourcestamp["revision"]
 
             title = "Build #{buildid}".format(buildid=build["buildid"])
@@ -122,13 +152,13 @@ class SlackStatusPush(ReporterBase):
             fields = []
             if not sub_build:
                 branch_name = sourcestamp["branch"]
-                if branch_name:
+                if branch_name and self.with_branch:
                     fields.append({"title": "Branch", "value": branch_name, "short": True})
                 repositories = sourcestamp["repository"]
-                if repositories:
+                if repositories and self.with_repository:
                     fields.append({"title": "Repository", "value": repositories, "short": True})
                 responsible_users = yield utils.getResponsibleUsersForBuild(self.master, build["buildid"])
-                if responsible_users:
+                if responsible_users and self.with_responsible_user:
                     fields.append(
                         {
                             "title": "Committers",
@@ -137,7 +167,13 @@ class SlackStatusPush(ReporterBase):
                         }
                     )
                 builder_name = build["builder"]["name"]
-                fields.append({"title": "Builder", "value": builder_name, "short": True})
+                if self.with_builder:
+                    fields.append({"title": "Builder", "value": builder_name, "short": True})
+                if self.extra_properties != None:
+                    for extra_property in self.extra_properties:
+                        property_value = build["properties"].getProperty(extra_property)
+                        if property_value:
+                            fields.append({"title": extra_property, "value": property_value}, "short": True)
             attachments.append(
                 {
                     "title": title,
@@ -191,10 +227,12 @@ class SlackStatusPush(ReporterBase):
     def sendMessage(self, reports):
         # We only use the first report, even if multiple are passed
         report = reports[0]
-        print(report)
         # We also only report on the first build, even if multiple are present
         build = report["builds"][0]
-        print(report["builds"])
+
+        # Skip unwanted builders, if specified
+        if self.builder != None and build["builder"]["name"] not in self.builder:
+            return
         postData = yield self.getBuildDetailsAndSendMessage(report)
         if not postData:
             return
@@ -202,6 +240,8 @@ class SlackStatusPush(ReporterBase):
         sourcestamps = build["buildset"]["sourcestamps"]
 
         for sourcestamp in sourcestamps:
+            if self.codebases != None and sourcestamp["codebase"] not in self.codebases:
+                continue
             sha = sourcestamp["revision"]
             if sha is None:
                 logger.info("no special revision for this")
