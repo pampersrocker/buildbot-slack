@@ -2,6 +2,7 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
+from buildbot.process.properties import Properties
 from buildbot.process.results import statusToString
 from buildbot.reporters import utils
 from buildbot.reporters.base import ReporterBase
@@ -170,10 +171,10 @@ class SlackStatusPush(ReporterBase):
                 if self.with_builder:
                     fields.append({"title": "Builder", "value": builder_name, "short": True})
                 if self.extra_properties != None:
+                    props = Properties.fromDict(build['properties'])
                     for extra_property in self.extra_properties:
-                        property_value = build["properties"].getProperty(extra_property)
-                        if property_value:
-                            fields.append({"title": extra_property, "value": property_value}, "short": True)
+                        if extra_property in props:
+                            fields.append({"title": extra_property, "value": props[extra_property], "short": True})
             attachments.append(
                 {
                     "title": title,
@@ -229,7 +230,6 @@ class SlackStatusPush(ReporterBase):
         report = reports[0]
         # We also only report on the first build, even if multiple are present
         build = report["builds"][0]
-
         # Skip unwanted builders, if specified
         if self.builder != None and build["builder"]["name"] not in self.builder:
             return
