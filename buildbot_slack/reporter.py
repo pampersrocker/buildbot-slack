@@ -7,8 +7,8 @@ from buildbot.process.results import statusToString
 from buildbot.reporters import utils
 from buildbot.reporters.base import ReporterBase
 from buildbot.util import httpclientservice
-from buildbot.util.logger import Logger
 from twisted.internet import defer
+from twisted.logger import Logger
 from buildbot.reporters.generators.build import BuildStartEndStatusGenerator
 from buildbot.reporters.generators.buildrequest import BuildRequestGenerator
 from buildbot.reporters.message import MessageFormatterRenderable
@@ -203,6 +203,9 @@ class SlackStatusPush(ReporterBase):
 
         if self.channel:
             postData["channel"] = self.channel
+
+        if self.username:
+            postData["user_name"] = self.username
 
         extra_params = yield self.getExtraParams(build)
         postData.update(extra_params)
