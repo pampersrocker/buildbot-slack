@@ -797,7 +797,7 @@ class SlackStatusPush(ReporterBase):
 
             for _hist_model in history:
                 hist_build = self._db_model_to_dict(_hist_model)
-                hist_buildid = hist_build.get("buildid")
+                hist_buildid = hist_build.get("buildid") or hist_build.get("id")
                 if hist_buildid == build.get("buildid"):
                     continue
 
@@ -806,6 +806,8 @@ class SlackStatusPush(ReporterBase):
                 if hist_results != 0:
                     continue
 
+                if not hist_buildid:
+                    continue
                 hist_full_build = yield self.master.data.get(("builds", hist_buildid))
                 if not hist_full_build:
                     continue
@@ -956,7 +958,7 @@ class SlackStatusPush(ReporterBase):
                 current_props = self._extract_eta_properties(build)
                 for _hist_model in history:
                     hist_build = self._db_model_to_dict(_hist_model)
-                    hist_buildid = hist_build.get("buildid")
+                    hist_buildid = hist_build.get("buildid") or hist_build.get("id")
                     if hist_buildid == buildid:
                         continue
                     # Only use successful completed builds for ETA.
@@ -969,6 +971,8 @@ class SlackStatusPush(ReporterBase):
                     durations.append(duration)
 
                     if not current_props:
+                        continue
+                    if not hist_buildid:
                         continue
                     hist_full_build = yield self.master.data.get(("builds", hist_buildid))
                     if not hist_full_build:
