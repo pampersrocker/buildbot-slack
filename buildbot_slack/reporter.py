@@ -1235,9 +1235,68 @@ class SlackStatusPush(ReporterBase):
             logger.error("Could not decode Slack API response for {path}: {error}", path=api_path, error=exc)
             return None
         if not data.get("ok"):
-            logger.error("Slack API {path} returned an error: {error}", path=api_path, error=data.get("error"))
+            logger.error(
+                "Slack API {path} returned an error: {error} (detail={detail})",
+                path=api_path,
+                error=data.get("error"),
+                detail=data.get("response_metadata") or data,
+            )
             return None
         return data
+
+    @defer.inlineCallbacks
+    def _call_slack_api_form(self, path, payload):
+        """Call Slack Web API with application/x-www-form-urlencoded payload."""
+        if not self.slack_token:
+            logger.error("Slack Web API is not configured correctly")
+            return None
+        try:
+            import treq as _treq
+        except ImportError:
+            logger.error("treq is required for form-encoded Slack API requests")
+            return None
+
+        api_path = path if path.startswith("/") else "/{path}".format(path=path)
+        url = "{base}{path}".format(base=self.api_base.rstrip("/"), path=api_path)
+        headers = {
+            b"Authorization": ("Bearer {token}".format(token=self.slack_token)).encode("utf-8"),
+        }
+        try:
+            response = yield _treq.post(url, data=payload, headers=headers)
+            content = yield _treq.content(response)
+            raw = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
+            data = json.loads(raw)
+        except Exception as exc:
+            logger.error("Slack form API request failed at {path}: {error}", path=api_path, error=exc)
+            return None
+
+        if response.code != 200:
+            logger.error("{code}: Slack form API request failed at {path}: {content}", code=response.code, path=api_path, content=raw)
+            return None
+        if not data.get("ok"):
+            logger.error(
+                "Slack API {path} returned an error: {error} (detail={detail})",
+                path=api_path,
+                error=data.get("error"),
+                detail=data.get("response_metadata") or data,
+            )
+            return None
+        return data
+
+    def _sanitize_log_filename(self, filename):
+        raw = str(filename or "buildbot_step_log.txt")
+        cleaned = []
+        for ch in raw:
+            if ch.isalnum() or ch in ("_", "-", "."):
+                cleaned.append(ch)
+            else:
+                cleaned.append("_")
+        safe = "".join(cleaned).strip("._")
+        if not safe:
+            safe = "buildbot_step_log"
+        if not safe.endswith(".txt"):
+            safe += ".txt"
+        return safe[:120]
 
     @defer.inlineCallbacks
     def _send_step_progress_update(self, buildid, force=False):
@@ -1382,42 +1441,30 @@ class SlackStatusPush(ReporterBase):
             logger.warn("treq is not available; cannot upload log file to Slack")
             return
 
-        normalized_filename = str(filename or "buildbot_step_log.txt")
+        normalized_filename = self._sanitize_log_filename(filename)
         content_bytes = content.encode("utf-8") if isinstance(content, str) else (content or b"")
         if not content_bytes:
             content_bytes = b"\n"
 
         # Step 1: obtain a pre-signed upload URL.
-        url_response = yield self._call_slack_api("files.getUploadURLExternal", {
+        url_response = yield self._call_slack_api_form("files.getUploadURLExternal", {
             "filename": normalized_filename,
             "length": int(len(content_bytes)),
         })
         if url_response is None:
-            yield self._upload_log_file_to_slack_legacy(
-                filename=normalized_filename,
-                content_bytes=content_bytes,
-                channel=channel,
-                thread_ts=thread_ts,
-            )
             return
         upload_url = url_response.get("upload_url")
         file_id = url_response.get("file_id")
         if not upload_url or not file_id:
             logger.warn("Slack did not return upload_url/file_id for {filename}", filename=normalized_filename)
-            yield self._upload_log_file_to_slack_legacy(
-                filename=normalized_filename,
-                content_bytes=content_bytes,
-                channel=channel,
-                thread_ts=thread_ts,
-            )
             return
 
-        # Step 2: PUT the file content to the pre-signed URL.
+        # Step 2: POST file bytes to the pre-signed URL.
         try:
-            upload_resp = yield _treq.put(
+            upload_resp = yield _treq.post(
                 upload_url,
                 data=content_bytes,
-                headers={b"Content-Type": b"text/plain; charset=utf-8"},
+                headers={b"Content-Type": b"application/octet-stream"},
             )
             if upload_resp.code not in (200, 204):
                 body = yield _treq.content(upload_resp)
@@ -1437,42 +1484,6 @@ class SlackStatusPush(ReporterBase):
             "channel_id": channel,
             "thread_ts": thread_ts,
         })
-
-    @defer.inlineCallbacks
-    def _upload_log_file_to_slack_legacy(self, filename, content_bytes, channel, thread_ts):
-        """Fallback upload path for workspaces where upload-url flow rejects arguments."""
-        try:
-            import treq as _treq
-        except ImportError:
-            return
-
-        if not self.slack_token:
-            return
-
-        payload = {
-            "channels": channel,
-            "thread_ts": thread_ts,
-            "filename": str(filename or "buildbot_step_log.txt"),
-            "title": str(filename or "buildbot_step_log.txt"),
-            "filetype": "text",
-            "content": content_bytes.decode("utf-8", errors="replace"),
-        }
-
-        try:
-            resp = yield _treq.post(
-                "https://slack.com/api/files.upload",
-                data=payload,
-                headers={
-                    b"Authorization": ("Bearer {token}".format(token=self.slack_token)).encode("utf-8"),
-                },
-            )
-            body = yield _treq.content(resp)
-            body_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-            data = json.loads(body_text)
-            if not data.get("ok"):
-                logger.warn("Slack legacy file upload failed: {error}", error=data.get("error"))
-        except Exception as exc:
-            logger.warn("Slack legacy file upload request failed: {error}", error=exc)
 
     @defer.inlineCallbacks
     def sendMessage(self, reports):
