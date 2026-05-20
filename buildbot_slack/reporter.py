@@ -13,6 +13,7 @@ from buildbot.reporters import utils
 from buildbot.reporters.base import ReporterBase
 from buildbot.util import httpclientservice
 from twisted.internet import defer
+from twisted.internet import task
 from twisted.logger import Logger
 from buildbot.reporters.generators.build import BuildStartEndStatusGenerator
 from buildbot.reporters.generators.buildrequest import BuildRequestGenerator
@@ -118,6 +119,7 @@ class SlackStatusPush(ReporterBase):
         use_web_api=False,
         api_base="https://slack.com/api",
         throttle_interval_secs=4,
+        progress_refresh_secs=15,
         eta_history_limit=10,
         progress_bar_width=12,
         verbose=False,
@@ -161,6 +163,7 @@ class SlackStatusPush(ReporterBase):
         self._state_object_name = self._build_state_object_name()
         self._state_object_id = None
         self.throttle_interval_secs = max(float(throttle_interval_secs), 0.0)
+        self.progress_refresh_secs = max(float(progress_refresh_secs), 2.0)
         self.eta_history_limit = max(int(eta_history_limit), 1)
         self.progress_bar_width = max(int(progress_bar_width), 5)
         self.eta_match_properties = self._normalize_property_list(eta_match_properties)
@@ -175,6 +178,7 @@ class SlackStatusPush(ReporterBase):
         self._last_step_update = {}
         self._channel_name_cache = {}
         self._step_event_consumers = {}
+        self._progress_update_tasks = {}
 
         if self.endpoint:
             self._http = yield httpclientservice.HTTPClientService.getService(
@@ -229,6 +233,8 @@ class SlackStatusPush(ReporterBase):
 
     @defer.inlineCallbacks
     def stopService(self):
+        for buildid in list(getattr(self, "_progress_update_tasks", {}).keys()):
+            self._stop_periodic_progress_updates(buildid)
         for key in list(getattr(self, "_step_event_consumers", {}).keys()):
             yield self._step_event_consumers[key].stopConsuming()
             del self._step_event_consumers[key]
@@ -460,6 +466,7 @@ class SlackStatusPush(ReporterBase):
     @defer.inlineCallbacks
     def _clear_build_state(self, buildid):
         state_key = self._state_key(buildid)
+        self._stop_periodic_progress_updates(buildid)
         if state_key in self._message_refs:
             del self._message_refs[state_key]
         objectid = yield self._ensure_state_object_id()
@@ -494,6 +501,7 @@ class SlackStatusPush(ReporterBase):
                 "builderid": builder_info.get("builderid") or build.get("builderid"),
                 "builder_name": builder_info.get("name"),
                 "estimated_total_steps": None,
+                "planned_total_steps": None,
             }
         steps = build.get("steps") or []
         runtime_state = self._runtime[state_key]
@@ -535,7 +543,54 @@ class SlackStatusPush(ReporterBase):
         else:
             runtime_state["current_step"] = step_name
 
+        self._ensure_periodic_progress_updates(buildid)
+
         yield self._send_step_progress_update(buildid)
+
+    def _stop_periodic_progress_updates(self, buildid):
+        task_key = self._state_key(buildid)
+        progress_task = self._progress_update_tasks.get(task_key)
+        if progress_task is None:
+            return
+        if progress_task.running:
+            progress_task.stop()
+        del self._progress_update_tasks[task_key]
+
+    def _on_periodic_progress_error(self, failure, buildid):
+        # LoopingCall stops with CancelledError when explicitly stopped.
+        if not failure.check(defer.CancelledError):
+            logger.warn(
+                "Periodic progress update failed for build {buildid}: {error}",
+                buildid=buildid,
+                error=failure,
+            )
+        self._stop_periodic_progress_updates(buildid)
+
+    def _ensure_periodic_progress_updates(self, buildid):
+        if not self.use_web_api:
+            return
+        task_key = self._state_key(buildid)
+        existing = self._progress_update_tasks.get(task_key)
+        if existing is not None and existing.running:
+            return
+
+        progress_task = task.LoopingCall(self._periodic_progress_tick, buildid)
+        reactor = getattr(self.master, "reactor", None)
+        if reactor is not None:
+            progress_task.clock = reactor
+        deferred_loop = progress_task.start(self.progress_refresh_secs, now=False)
+        deferred_loop.addErrback(self._on_periodic_progress_error, buildid)
+        self._progress_update_tasks[task_key] = progress_task
+
+    @defer.inlineCallbacks
+    def _periodic_progress_tick(self, buildid):
+        if not self.use_web_api:
+            return
+        build = yield self.master.data.get(("builds", buildid))
+        if build is None or self._get_status_key(build) != "running":
+            self._stop_periodic_progress_updates(buildid)
+            return
+        yield self._send_step_progress_update(buildid, force=True)
 
     def _format_duration(self, seconds):
         if seconds is None:
@@ -595,6 +650,50 @@ class SlackStatusPush(ReporterBase):
             except Exception:
                 return default
         return default
+
+    def _coerce_duration_seconds(self, value, default=None):
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            duration = float(value)
+            return duration if duration >= 0 else default
+        if isinstance(value, str):
+            try:
+                duration = float(value)
+                return duration if duration >= 0 else default
+            except ValueError:
+                return default
+        total_seconds_fn = getattr(value, "total_seconds", None)
+        if callable(total_seconds_fn):
+            try:
+                duration = float(total_seconds_fn())
+                return duration if duration >= 0 else default
+            except Exception:
+                return default
+        return default
+
+    def _extract_build_duration_seconds(self, build):
+        duration_keys = (
+            "duration",
+            "duration_s",
+            "build_duration",
+            "build_duration_s",
+            "elapsed",
+            "elapsed_s",
+            "runtime",
+            "run_time",
+            "total_duration",
+        )
+        for key in duration_keys:
+            duration = self._coerce_duration_seconds(build.get(key))
+            if duration is not None:
+                return duration
+
+        start_time = self._coerce_timestamp(build.get("start_time") or build.get("started_at"))
+        complete_time = self._coerce_timestamp(build.get("complete_time") or build.get("complete_at"))
+        if start_time is None or complete_time is None:
+            return None
+        return max(complete_time - start_time, 0.0)
 
     def _extract_eta_properties(self, build):
         raw_props = build.get("properties") or {}
@@ -660,9 +759,16 @@ class SlackStatusPush(ReporterBase):
     @defer.inlineCallbacks
     def _estimate_total_steps(self, build, runtime_state):
         known_steps = max(len(runtime_state.get("known_steps", [])), 1)
+        factory_total = yield self._estimate_factory_total_steps(build, runtime_state)
         cached_total = runtime_state.get("estimated_total_steps")
+        baseline_totals = [known_steps]
+        if isinstance(factory_total, int) and factory_total > 0:
+            baseline_totals.append(factory_total)
         if isinstance(cached_total, int) and cached_total > 0:
-            return max(known_steps, cached_total)
+            baseline_totals.append(cached_total)
+
+        if isinstance(factory_total, int) and factory_total > 0 and isinstance(cached_total, int) and cached_total > 0:
+            return max(baseline_totals)
 
         builderid = runtime_state.get("builderid") or build.get("builderid")
         if builderid is None:
@@ -725,7 +831,8 @@ class SlackStatusPush(ReporterBase):
             if candidate_counts:
                 estimated_total = max(int(round(statistics.median(candidate_counts))), 1)
                 runtime_state["estimated_total_steps"] = estimated_total
-                return max(known_steps, estimated_total)
+                baseline_totals.append(estimated_total)
+                return max(baseline_totals)
         except Exception as exc:
             logger.warn(
                 "Unable to estimate total step count for build {buildid}: {error}",
@@ -733,7 +840,36 @@ class SlackStatusPush(ReporterBase):
                 error=exc,
             )
 
-        return known_steps
+        return max(baseline_totals)
+
+    @defer.inlineCallbacks
+    def _estimate_factory_total_steps(self, build, runtime_state):
+        cached = runtime_state.get("planned_total_steps")
+        if isinstance(cached, int) and cached > 0:
+            return cached
+
+        builder_name = yield self._get_builder_name(build, runtime_state)
+        if not builder_name or builder_name == "unknown":
+            return None
+
+        botmaster = getattr(self.master, "botmaster", None)
+        builders = getattr(botmaster, "builders", None)
+        builder_obj = None
+        if isinstance(builders, dict):
+            builder_obj = builders.get(builder_name)
+
+        if builder_obj is None:
+            return None
+
+        builder_config = getattr(builder_obj, "config", None)
+        factory = getattr(builder_config, "factory", None)
+        factory_steps = getattr(factory, "steps", None)
+        if not isinstance(factory_steps, list):
+            return None
+
+        planned_total = max(len(factory_steps), 1)
+        runtime_state["planned_total_steps"] = planned_total
+        return planned_total
 
     def _is_channel_id(self, channel):
         if not isinstance(channel, str) or not channel:
@@ -809,11 +945,9 @@ class SlackStatusPush(ReporterBase):
                     hist_buildid = hist_build.get("buildid")
                     if hist_buildid == buildid:
                         continue
-                    start_time = self._coerce_timestamp(hist_build.get("start_time"))
-                    complete_time = self._coerce_timestamp(hist_build.get("complete_time"))
-                    if start_time is None or complete_time is None:
+                    duration = self._extract_build_duration_seconds(hist_build)
+                    if duration is None:
                         continue
-                    duration = complete_time - start_time
                     durations.append(duration)
 
                     if not current_props:
@@ -958,7 +1092,7 @@ class SlackStatusPush(ReporterBase):
         return data
 
     @defer.inlineCallbacks
-    def _send_step_progress_update(self, buildid):
+    def _send_step_progress_update(self, buildid, force=False):
         if not self.use_web_api:
             return
         state_key = self._state_key(buildid)
@@ -967,7 +1101,7 @@ class SlackStatusPush(ReporterBase):
             return
         now = time.time()
         last_update = self._last_step_update.get(state_key)
-        if last_update is not None and (now - last_update) < self.throttle_interval_secs:
+        if not force and last_update is not None and (now - last_update) < self.throttle_interval_secs:
             return
 
         build = yield self.master.data.get(("builds", buildid))
@@ -1032,6 +1166,11 @@ class SlackStatusPush(ReporterBase):
                         update_payload["attachments"] = postData["attachments"]
                     logger.info("posting to Slack Web API chat.update")
                     yield self._call_slack_api("chat.update", update_payload)
+
+                if status_key == "running":
+                    self._ensure_periodic_progress_updates(buildid)
+                else:
+                    self._stop_periodic_progress_updates(buildid)
             else:
                 logger.info("posting to {url}", url=self.endpoint)
                 yield self._post_webhook_message(postData)
