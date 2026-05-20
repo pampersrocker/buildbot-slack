@@ -497,6 +497,9 @@ class SlackStatusPush(ReporterBase):
             }
         steps = build.get("steps") or []
         runtime_state = self._runtime[state_key]
+        self._refresh_runtime_from_steps(runtime_state, steps)
+
+    def _refresh_runtime_from_steps(self, runtime_state, steps):
         for step in steps:
             step_name = step.get("name")
             if not step_name:
@@ -685,7 +688,9 @@ class SlackStatusPush(ReporterBase):
                 hist_full_build = yield self.master.data.get(("builds", hist_buildid))
                 if not hist_full_build:
                     continue
-                hist_steps = hist_full_build.get("steps") or []
+                hist_steps = yield self.master.data.get(("builds", hist_buildid, "steps"))
+                if not hist_steps:
+                    hist_steps = hist_full_build.get("steps") or []
                 step_count = len(hist_steps)
                 if step_count <= 0:
                     continue
@@ -785,6 +790,8 @@ class SlackStatusPush(ReporterBase):
 
     @defer.inlineCallbacks
     def _estimate_eta_seconds(self, build, runtime_state, elapsed):
+        total_steps = yield self._estimate_total_steps(build, runtime_state)
+        finished_steps = len(runtime_state.get("finished_steps", []))
         builderid = runtime_state.get("builderid")
         buildid = build.get("buildid")
         if builderid is not None:
@@ -839,14 +846,19 @@ class SlackStatusPush(ReporterBase):
 
                 if candidate_durations:
                     median_duration = statistics.median(candidate_durations)
-                    return max(int(median_duration - elapsed), 0)
+                    duration_eta = max(int(median_duration - elapsed), 0)
+
+                    if finished_steps > 0 and total_steps > finished_steps:
+                        projected_total = (elapsed / float(finished_steps)) * float(total_steps)
+                        step_eta = max(int(projected_total - elapsed), 0)
+                        return max(duration_eta, step_eta)
+
+                    return duration_eta
             except Exception as exc:
                 logger.warn("Unable to compute historical ETA for build {buildid}: {error}", buildid=buildid, error=exc)
 
-        known_steps = max(len(runtime_state.get("known_steps", [])), 1)
-        finished_steps = len(runtime_state.get("finished_steps", []))
         if finished_steps > 0:
-            projected_total = (elapsed / float(finished_steps)) * known_steps
+            projected_total = (elapsed / float(finished_steps)) * float(total_steps)
             return max(int(projected_total - elapsed), 0)
         return None
 
@@ -963,6 +975,11 @@ class SlackStatusPush(ReporterBase):
         if build is None or runtime_state is None:
             return
         self._initialize_runtime(build)
+
+        steps = yield self.master.data.get(("builds", buildid, "steps"))
+        if steps:
+            self._refresh_runtime_from_steps(runtime_state, steps)
+
         runtime_state = self._runtime.get(state_key)
         text = yield self._build_progress_text(build, runtime_state)
 
