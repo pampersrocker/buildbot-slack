@@ -629,6 +629,16 @@ class SlackStatusPush(ReporterBase):
             return value
         return None
 
+    @staticmethod
+    def _db_model_to_dict(model):
+        """Convert a Buildbot DB model object (dataclass) to a plain dict."""
+        if isinstance(model, dict):
+            return model
+        import dataclasses
+        if dataclasses.is_dataclass(model) and not isinstance(model, type):
+            return dataclasses.asdict(model)
+        return vars(model)
+
     def _coerce_timestamp(self, value, default=None):
         if value is None:
             return default
@@ -785,7 +795,8 @@ class SlackStatusPush(ReporterBase):
             best_match_score = -1
             current_props = self._extract_eta_properties(build)
 
-            for hist_build in history:
+            for _hist_model in history:
+                hist_build = self._db_model_to_dict(_hist_model)
                 hist_buildid = hist_build.get("buildid")
                 if hist_buildid == build.get("buildid"):
                     continue
@@ -943,7 +954,8 @@ class SlackStatusPush(ReporterBase):
                 best_match_durations = []
                 best_match_score = -1
                 current_props = self._extract_eta_properties(build)
-                for hist_build in history:
+                for _hist_model in history:
+                    hist_build = self._db_model_to_dict(_hist_model)
                     hist_buildid = hist_build.get("buildid")
                     if hist_buildid == buildid:
                         continue
