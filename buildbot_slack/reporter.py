@@ -482,11 +482,13 @@ class SlackStatusPush(ReporterBase):
             return
         state_key = self._state_key(buildid)
         if state_key not in self._runtime:
+            raw_start_time = build.get("started_at") or build.get("start_time") or time.time()
+            start_time = self._coerce_timestamp(raw_start_time, default=time.time())
             self._runtime[state_key] = {
                 "known_steps": set(),
                 "finished_steps": set(),
                 "current_step": None,
-                "start_time": build.get("started_at") or build.get("start_time") or time.time(),
+                "start_time": start_time,
                 "builderid": (build.get("builder") or {}).get("builderid"),
             }
         steps = build.get("steps") or []
@@ -564,6 +566,28 @@ class SlackStatusPush(ReporterBase):
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return None
+
+    def _coerce_timestamp(self, value, default=None):
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return default
+        timestamp_fn = getattr(value, "timestamp", None)
+        if callable(timestamp_fn):
+            try:
+                ts_value = timestamp_fn()
+                if isinstance(ts_value, (int, float)):
+                    return float(ts_value)
+                if isinstance(ts_value, str):
+                    return float(ts_value)
+            except Exception:
+                return default
+        return default
 
     def _extract_eta_properties(self, build):
         raw_props = build.get("properties") or {}
@@ -665,11 +689,11 @@ class SlackStatusPush(ReporterBase):
                     hist_buildid = hist_build.get("buildid")
                     if hist_buildid == buildid:
                         continue
-                    start_time = hist_build.get("start_time")
-                    complete_time = hist_build.get("complete_time")
+                    start_time = self._coerce_timestamp(hist_build.get("start_time"))
+                    complete_time = self._coerce_timestamp(hist_build.get("complete_time"))
                     if start_time is None or complete_time is None:
                         continue
-                    duration = float(complete_time) - float(start_time)
+                    duration = complete_time - start_time
                     durations.append(duration)
 
                     if not current_props:
@@ -727,7 +751,10 @@ class SlackStatusPush(ReporterBase):
         )
 
         now = time.time()
-        elapsed_seconds = max(now - float(runtime_state.get("start_time", now)), 0.0)
+        start_time = self._coerce_timestamp(runtime_state.get("start_time", now), default=now)
+        if start_time is None:
+            start_time = now
+        elapsed_seconds = max(now - start_time, 0.0)
         eta_seconds = yield self._estimate_eta_seconds(build, runtime_state, elapsed_seconds)
         current_step = runtime_state.get("current_step") or "waiting"
 
