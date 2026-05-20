@@ -251,6 +251,9 @@ class SlackStatusPush(ReporterBase):
         sourcestamps = buildset.get("sourcestamps") or []
         attachments = []
         build_status = self._get_status_key(build)
+        state_key = self._state_key(build.get("buildid"))
+        runtime_state = self._runtime.get(state_key)
+        builder_name = yield self._get_builder_name(build, runtime_state)
 
         for sourcestamp in sourcestamps:
             if self.codebases != None and sourcestamp.get("codebase") not in self.codebases:
@@ -285,7 +288,6 @@ class SlackStatusPush(ReporterBase):
                             "short": True,
                         }
                     )
-                builder_name = (build.get("builder") or {}).get("name")
                 if self.with_builder:
                     fields.append({"title": "Builder", "value": builder_name, "short": True})
                 if self.extra_properties != None:
@@ -305,13 +307,12 @@ class SlackStatusPush(ReporterBase):
                 }
             )
         if not attachments:
-            builder_name = (build.get("builder") or {}).get("name", "unknown")
             attachments.append(
                 {
                     "title": "Build #{buildid}".format(buildid=build.get("buildid", "?")),
                     "title_link": build.get("url", ""),
                     "fallback": "Build #{buildid}".format(buildid=build.get("buildid", "?")),
-                    "text": "Builder: *{builder}*\\nStatus: *{status}*".format(
+                    "text": "Builder: *{builder}*\nStatus: *{status}*".format(
                         builder=builder_name,
                         status=build_status,
                     ),
@@ -484,12 +485,15 @@ class SlackStatusPush(ReporterBase):
         if state_key not in self._runtime:
             raw_start_time = build.get("started_at") or build.get("start_time") or time.time()
             start_time = self._coerce_timestamp(raw_start_time, default=time.time())
+            builder_info = build.get("builder") or {}
             self._runtime[state_key] = {
                 "known_steps": set(),
                 "finished_steps": set(),
                 "current_step": None,
                 "start_time": start_time,
-                "builderid": (build.get("builder") or {}).get("builderid"),
+                "builderid": builder_info.get("builderid") or build.get("builderid"),
+                "builder_name": builder_info.get("name"),
+                "estimated_total_steps": None,
             }
         steps = build.get("steps") or []
         runtime_state = self._runtime[state_key]
@@ -617,6 +621,115 @@ class SlackStatusPush(ReporterBase):
                 score += 1
         return (score, len(comparable_keys))
 
+    @defer.inlineCallbacks
+    def _get_builder_name(self, build, runtime_state=None):
+        builder_info = build.get("builder") or {}
+        builder_name = builder_info.get("name")
+        if builder_name:
+            if runtime_state is not None:
+                runtime_state["builder_name"] = builder_name
+            return builder_name
+
+        if runtime_state is not None and runtime_state.get("builder_name"):
+            return runtime_state["builder_name"]
+
+        builderid = (
+            builder_info.get("builderid")
+            or build.get("builderid")
+            or (runtime_state or {}).get("builderid")
+        )
+        if builderid is None:
+            return "unknown"
+
+        try:
+            builder_data = yield self.master.data.get(("builders", builderid))
+            resolved_name = (builder_data or {}).get("name")
+            if resolved_name:
+                if runtime_state is not None:
+                    runtime_state["builder_name"] = resolved_name
+                    runtime_state["builderid"] = builderid
+                return resolved_name
+        except Exception as exc:
+            logger.warn("Unable to resolve builder name for builderid {builderid}: {error}", builderid=builderid, error=exc)
+
+        return "unknown"
+
+    @defer.inlineCallbacks
+    def _estimate_total_steps(self, build, runtime_state):
+        known_steps = max(len(runtime_state.get("known_steps", [])), 1)
+        cached_total = runtime_state.get("estimated_total_steps")
+        if isinstance(cached_total, int) and cached_total > 0:
+            return max(known_steps, cached_total)
+
+        builderid = runtime_state.get("builderid") or build.get("builderid")
+        if builderid is None:
+            return known_steps
+
+        try:
+            history = yield self.master.db.builds.getBuilds(
+                builderid=builderid,
+                limit=self.eta_history_limit,
+            )
+
+            step_counts = []
+            perfect_match_counts = []
+            best_match_counts = []
+            best_match_score = -1
+            current_props = self._extract_eta_properties(build)
+
+            for hist_build in history:
+                hist_buildid = hist_build.get("buildid")
+                if hist_buildid == build.get("buildid"):
+                    continue
+
+                hist_full_build = yield self.master.data.get(("builds", hist_buildid))
+                if not hist_full_build:
+                    continue
+                hist_steps = hist_full_build.get("steps") or []
+                step_count = len(hist_steps)
+                if step_count <= 0:
+                    continue
+                step_counts.append(step_count)
+
+                if not current_props:
+                    continue
+
+                candidate_props = self._extract_eta_properties(hist_full_build)
+                score, comparable_count = self._score_property_match(current_props, candidate_props)
+                if comparable_count == 0:
+                    continue
+                if score == comparable_count:
+                    perfect_match_counts.append(step_count)
+                    continue
+                if score <= 0:
+                    continue
+                if score > best_match_score:
+                    best_match_score = score
+                    best_match_counts = [step_count]
+                elif score == best_match_score:
+                    best_match_counts.append(step_count)
+
+            candidate_counts = None
+            if perfect_match_counts:
+                candidate_counts = perfect_match_counts
+            elif best_match_counts:
+                candidate_counts = best_match_counts
+            elif step_counts:
+                candidate_counts = step_counts
+
+            if candidate_counts:
+                estimated_total = max(int(round(statistics.median(candidate_counts))), 1)
+                runtime_state["estimated_total_steps"] = estimated_total
+                return max(known_steps, estimated_total)
+        except Exception as exc:
+            logger.warn(
+                "Unable to estimate total step count for build {buildid}: {error}",
+                buildid=build.get("buildid"),
+                error=exc,
+            )
+
+        return known_steps
+
     def _is_channel_id(self, channel):
         if not isinstance(channel, str) or not channel:
             return False
@@ -739,9 +852,9 @@ class SlackStatusPush(ReporterBase):
 
     @defer.inlineCallbacks
     def _build_progress_text(self, build, runtime_state):
-        known_steps = max(len(runtime_state.get("known_steps", [])), 1)
+        total_steps = yield self._estimate_total_steps(build, runtime_state)
         finished_steps = len(runtime_state.get("finished_steps", []))
-        progress_ratio = min(float(finished_steps) / float(known_steps), 1.0)
+        progress_ratio = min(float(finished_steps) / float(total_steps), 1.0)
         done_blocks = int(progress_ratio * self.progress_bar_width)
         pending_blocks = self.progress_bar_width - done_blocks
         progress_bar = "[{done}{pending}] {pct:3.0f}%".format(
@@ -757,13 +870,16 @@ class SlackStatusPush(ReporterBase):
         elapsed_seconds = max(now - start_time, 0.0)
         eta_seconds = yield self._estimate_eta_seconds(build, runtime_state, elapsed_seconds)
         current_step = runtime_state.get("current_step") or "waiting"
+        builder_name = yield self._get_builder_name(build, runtime_state)
+        build_label = "#{buildid}".format(buildid=build.get("buildid", "?"))
 
         lines = [
             "{emoji} Build in progress".format(emoji=STATUS_EMOJIS["running"]),
+            "Build: {build} on *{builder}*".format(build=build_label, builder=builder_name),
             "Step: *{current}* ({done}/{total})".format(
                 current=current_step,
                 done=finished_steps,
-                total=known_steps,
+                total=total_steps,
             ),
             "Progress: {bar}".format(bar=progress_bar),
             "Elapsed: {elapsed}".format(elapsed=self._format_duration(elapsed_seconds)),
@@ -772,7 +888,7 @@ class SlackStatusPush(ReporterBase):
             lines.append("ETA: {eta}".format(eta=self._format_duration(eta_seconds)))
         if build.get("url"):
             lines.append("Details: {url}".format(url=build["url"]))
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _should_skip_build(self, build):
         if self.builder != None and (build.get("builder") or {}).get("name") not in self.builder:
@@ -855,8 +971,6 @@ class SlackStatusPush(ReporterBase):
             "ts": message_ref["ts"],
             "text": text,
         }
-        if self.attachments:
-            update_payload["attachments"] = yield self.getAttachments(build)
 
         api_response = yield self._call_slack_api("chat.update", update_payload)
         if api_response is not None:
