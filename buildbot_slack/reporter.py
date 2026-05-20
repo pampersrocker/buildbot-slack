@@ -137,6 +137,7 @@ class SlackStatusPush(ReporterBase):
         extra_properties=None,
         failure_thread=True,
         failure_thread_upload_logs=True,
+        show_step_progress=True,
         **kwargs,
     ):
         self.debug = debug
@@ -160,6 +161,7 @@ class SlackStatusPush(ReporterBase):
         self.extra_properties = extra_properties
         self.failure_thread = bool(failure_thread)
         self.failure_thread_upload_logs = bool(failure_thread_upload_logs)
+        self.show_step_progress = bool(show_step_progress)
         self.use_web_api = bool(use_web_api)
         self.slack_token = slack_token
         self.api_base = api_base
@@ -506,6 +508,8 @@ class SlackStatusPush(ReporterBase):
                 "builder_name": builder_info.get("name"),
                 "estimated_total_steps": None,
                 "planned_total_steps": None,
+                "step_start_times": {},
+                "step_duration_estimates": {},
             }
         steps = build.get("steps") or []
         runtime_state = self._runtime[state_key]
@@ -546,6 +550,7 @@ class SlackStatusPush(ReporterBase):
                 runtime_state["current_step"] = None
         else:
             runtime_state["current_step"] = step_name
+            runtime_state.setdefault("step_start_times", {})[step_name] = time.time()
 
         self._ensure_periodic_progress_updates(buildid)
 
@@ -769,6 +774,60 @@ class SlackStatusPush(ReporterBase):
             logger.warn("Unable to resolve builder name for builderid {builderid}: {error}", builderid=builderid, error=exc)
 
         return "unknown"
+
+    @defer.inlineCallbacks
+    def _estimate_step_duration_seconds(self, build, runtime_state, step_name):
+        """Return the median duration of step_name across recent successful builds, or None."""
+        cache = runtime_state.setdefault("step_duration_estimates", {})
+        if step_name in cache:
+            return cache[step_name]
+
+        builderid = runtime_state.get("builderid") or build.get("builderid")
+        if builderid is None:
+            cache[step_name] = None
+            return None
+
+        try:
+            history = (yield self.master.db.builds.getBuilds(
+                builderid=builderid,
+            ) or [])[:self.eta_history_limit]
+
+            durations = []
+            for _model in history:
+                hist_build = self._db_model_to_dict(_model)
+                hist_buildid = hist_build.get("buildid") or hist_build.get("id")
+                if not hist_buildid or hist_buildid == build.get("buildid"):
+                    continue
+                if hist_build.get("results") != 0:
+                    continue
+                try:
+                    hist_steps = yield self.master.data.get(("builds", hist_buildid, "steps"))
+                except Exception:
+                    continue
+                for step in (hist_steps or []):
+                    if step.get("name") != step_name:
+                        continue
+                    started_at = self._coerce_timestamp(step.get("started_at"))
+                    complete_at = self._coerce_timestamp(step.get("complete_at"))
+                    if started_at is not None and complete_at is not None:
+                        dur = complete_at - started_at
+                        if dur > 0:
+                            durations.append(dur)
+                    break
+
+            if durations:
+                est = statistics.median(durations)
+                cache[step_name] = est
+                return est
+        except Exception as exc:
+            logger.warn(
+                "Unable to estimate step duration for {step}: {error}",
+                step=step_name,
+                error=exc,
+            )
+
+        cache[step_name] = None
+        return None
 
     @defer.inlineCallbacks
     def _estimate_total_steps(self, build, runtime_state):
@@ -1076,19 +1135,51 @@ class SlackStatusPush(ReporterBase):
         builder_name = yield self._get_builder_name(build, runtime_state)
         build_label = "#{buildid}".format(buildid=build.get("buildid", "?"))
 
+        # Build step line, optionally followed immediately by per-step progress.
+        step_line = "Step: *{current}* ({done}/{total})".format(
+            current=current_step,
+            done=finished_steps,
+            total=total_steps,
+        )
+        step_progress_line = None
+        if self.show_step_progress and current_step and current_step != "waiting":
+            step_start = runtime_state.get("step_start_times", {}).get(current_step)
+            if step_start is not None:
+                step_elapsed = max(now - step_start, 0.0)
+                step_est = yield self._estimate_step_duration_seconds(build, runtime_state, current_step)
+                if step_est and step_est > 0:
+                    step_ratio = min(step_elapsed / step_est, 1.0)
+                    step_eta = max(step_est - step_elapsed, 0.0)
+                    step_done = int(step_ratio * self.progress_bar_width)
+                    step_pending = self.progress_bar_width - step_done
+                    step_bar = "[{done}{pending}] {pct:3.0f}%".format(
+                        done="#" * step_done,
+                        pending="-" * step_pending,
+                        pct=step_ratio * 100.0,
+                    )
+                    step_progress_line = "Step progress: {bar} | ETA: {eta}".format(
+                        bar=step_bar,
+                        eta=self._format_duration(step_eta),
+                    )
+                else:
+                    step_progress_line = "Step elapsed: {elapsed}".format(
+                        elapsed=self._format_duration(step_elapsed)
+                    )
+
         lines = [
             "{emoji} Build in progress".format(emoji=STATUS_EMOJIS["running"]),
             "Build: {build} on *{builder}*".format(build=build_label, builder=builder_name),
-            "Step: *{current}* ({done}/{total})".format(
-                current=current_step,
-                done=finished_steps,
-                total=total_steps,
-            ),
+            step_line,
+        ]
+        if step_progress_line:
+            lines.append(step_progress_line)
+        lines += [
             "Progress: {bar}".format(bar=progress_bar),
             "Elapsed: {elapsed}".format(elapsed=self._format_duration(elapsed_seconds)),
         ]
         if eta_seconds is not None:
             lines.append("ETA: {eta}".format(eta=self._format_duration(eta_seconds)))
+
         if build.get("url"):
             lines.append("Details: {url}".format(url=build["url"]))
         return "\n".join(lines)

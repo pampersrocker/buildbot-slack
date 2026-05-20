@@ -113,6 +113,7 @@ Common options:
   eta_match_properties = None
   eta_exclude_properties = None
   progress_bar_width = 12
+  show_step_progress = True
   failure_thread = True
   failure_thread_upload_logs = True
 ```
@@ -130,6 +131,10 @@ Failure thread options:
 
 - `failure_thread` (default `True`): post a threaded reply with failed step details when a build fails. Set to `False` to disable entirely.
 - `failure_thread_upload_logs` (default `True`): upload the `stdio`/`stderr` log of each failed step as a file attachment in the failure thread. Requires the `files:write` Slack scope and the `treq` Python package. Set to `False` to post only the step summary text without log files.
+
+Step progress options:
+
+- `show_step_progress` (default `True`): show a per-step progress bar and ETA beneath the overall build progress bar. The step ETA is estimated from the median duration of that named step across recent successful builds. On the first occurrence of a step name the estimate is computed and then cached for the remainder of the build. Set to `False` to hide the step-level bar entirely.
 
 Webhook mode options:
 
