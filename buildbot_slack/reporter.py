@@ -174,6 +174,7 @@ class SlackStatusPush(ReporterBase):
         self._runtime = {}
         self._last_step_update = {}
         self._channel_name_cache = {}
+        self._step_event_consumers = {}
 
         if self.endpoint:
             self._http = yield httpclientservice.HTTPClientService.getService(
@@ -191,7 +192,47 @@ class SlackStatusPush(ReporterBase):
                 verify=self.verify,
             )
 
+        yield self._reconfigure_step_event_consumers()
+
         yield self._ensure_state_object_id()
+
+    @defer.inlineCallbacks
+    def _reconfigure_step_event_consumers(self):
+        wanted_keys = set()
+        if self.use_web_api:
+            wanted_keys.update(
+                {
+                    ("builds", None, "steps", None, "started"),
+                    ("builds", None, "steps", None, "finished"),
+                }
+            )
+
+        for key in list(self._step_event_consumers.keys()):
+            if key not in wanted_keys:
+                yield self._step_event_consumers[key].stopConsuming()
+                del self._step_event_consumers[key]
+
+        for key in sorted(wanted_keys):
+            if key not in self._step_event_consumers:
+                self._step_event_consumers[key] = yield self.master.mq.startConsuming(
+                    self._got_step_event,
+                    key,
+                )
+
+    @defer.inlineCallbacks
+    def _got_step_event(self, key, msg):
+        event = key[-1]
+        if event == "started":
+            yield self.stepStarted(key, msg)
+        elif event == "finished":
+            yield self.stepFinished(key, msg)
+
+    @defer.inlineCallbacks
+    def stopService(self):
+        for key in list(getattr(self, "_step_event_consumers", {}).keys()):
+            yield self._step_event_consumers[key].stopConsuming()
+            del self._step_event_consumers[key]
+        yield super().stopService()
 
     def _create_default_generators(self):
         start_formatter = MessageFormatterRenderable('Build started.')
