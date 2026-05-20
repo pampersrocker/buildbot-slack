@@ -1382,19 +1382,34 @@ class SlackStatusPush(ReporterBase):
             logger.warn("treq is not available; cannot upload log file to Slack")
             return
 
-        content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+        normalized_filename = str(filename or "buildbot_step_log.txt")
+        content_bytes = content.encode("utf-8") if isinstance(content, str) else (content or b"")
+        if not content_bytes:
+            content_bytes = b"\n"
 
         # Step 1: obtain a pre-signed upload URL.
         url_response = yield self._call_slack_api("files.getUploadURLExternal", {
-            "filename": filename,
-            "length": len(content_bytes),
+            "filename": normalized_filename,
+            "length": int(len(content_bytes)),
         })
         if url_response is None:
+            yield self._upload_log_file_to_slack_legacy(
+                filename=normalized_filename,
+                content_bytes=content_bytes,
+                channel=channel,
+                thread_ts=thread_ts,
+            )
             return
         upload_url = url_response.get("upload_url")
         file_id = url_response.get("file_id")
         if not upload_url or not file_id:
-            logger.warn("Slack did not return upload_url/file_id for {filename}", filename=filename)
+            logger.warn("Slack did not return upload_url/file_id for {filename}", filename=normalized_filename)
+            yield self._upload_log_file_to_slack_legacy(
+                filename=normalized_filename,
+                content_bytes=content_bytes,
+                channel=channel,
+                thread_ts=thread_ts,
+            )
             return
 
         # Step 2: PUT the file content to the pre-signed URL.
@@ -1418,10 +1433,46 @@ class SlackStatusPush(ReporterBase):
 
         # Step 3: finalise the upload and share it into the thread.
         yield self._call_slack_api("files.completeUploadExternal", {
-            "files": [{"id": file_id}],
+            "files": [{"id": file_id, "title": normalized_filename}],
             "channel_id": channel,
             "thread_ts": thread_ts,
         })
+
+    @defer.inlineCallbacks
+    def _upload_log_file_to_slack_legacy(self, filename, content_bytes, channel, thread_ts):
+        """Fallback upload path for workspaces where upload-url flow rejects arguments."""
+        try:
+            import treq as _treq
+        except ImportError:
+            return
+
+        if not self.slack_token:
+            return
+
+        payload = {
+            "channels": channel,
+            "thread_ts": thread_ts,
+            "filename": str(filename or "buildbot_step_log.txt"),
+            "title": str(filename or "buildbot_step_log.txt"),
+            "filetype": "text",
+            "content": content_bytes.decode("utf-8", errors="replace"),
+        }
+
+        try:
+            resp = yield _treq.post(
+                "https://slack.com/api/files.upload",
+                data=payload,
+                headers={
+                    b"Authorization": ("Bearer {token}".format(token=self.slack_token)).encode("utf-8"),
+                },
+            )
+            body = yield _treq.content(resp)
+            body_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+            data = json.loads(body_text)
+            if not data.get("ok"):
+                logger.warn("Slack legacy file upload failed: {error}", error=data.get("error"))
+        except Exception as exc:
+            logger.warn("Slack legacy file upload request failed: {error}", error=exc)
 
     @defer.inlineCallbacks
     def sendMessage(self, reports):
