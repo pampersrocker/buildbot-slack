@@ -43,14 +43,24 @@ c['services'].append(reporters.SlackStatusPush(
 ))
 ```
 
+### Required Slack Scopes
+
+To ensure the bot functions correctly in Bot API mode, the following Slack API scopes must be granted:
+
+1. **`channels:read`**
+   - Allows the bot to list public channels and resolve their names to IDs.
+2. **`groups:read`**
+   - Allows the bot to list private channels (if the bot is a member) and resolve their names to IDs.
+3. **`chat:write`**
+   - Enables the bot to send messages to public or private channels.
+
+Ensure these scopes are included in the bot's OAuth configuration in Slack.
+
+---
+
 ### Bot API mode (single message + progress updates)
 
-Create a Slack app with a bot token and grant at least these scopes:
-
-- `chat:write`
-- `chat:write.public` (only if posting to channels the bot is not yet a member of)
-
-Install the app into your workspace, invite the bot to the target channel, then configure:
+Create a Slack app with a bot token and grant the required scopes (see above). Install the app into your workspace, invite the bot to the target channel, then configure:
 
 ```
 from buildbot.plugins import reporters
@@ -70,6 +80,8 @@ In this mode:
 - Build start creates a message.
 - Step events update the same message with progress and ETA.
 - Build finish updates the same message to final status.
+- If `channel` is provided as a name (for example `#builds`), it is resolved to a channel ID using Slack `conversations.list` before posting.
+- For private channels, the bot must be a member of that channel to post.
 
 ### Options
 

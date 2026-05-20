@@ -173,6 +173,7 @@ class SlackStatusPush(ReporterBase):
         self._message_refs = {}
         self._runtime = {}
         self._last_step_update = {}
+        self._channel_name_cache = {}
 
         if self.endpoint:
             self._http = yield httpclientservice.HTTPClientService.getService(
@@ -551,6 +552,59 @@ class SlackStatusPush(ReporterBase):
                 score += 1
         return (score, len(comparable_keys))
 
+    def _is_channel_id(self, channel):
+        if not isinstance(channel, str) or not channel:
+            return False
+        return channel[0] in ("C", "G", "D")
+
+    @defer.inlineCallbacks
+    def _resolve_channel_id(self, channel):
+        if channel is None:
+            return None
+        if self._is_channel_id(channel):
+            return channel
+
+        channel_name = channel.lstrip("#").strip()
+        if not channel_name:
+            return channel
+
+        cached = self._channel_name_cache.get(channel_name)
+        if cached:
+            return cached
+
+        cursor = None
+        while True:
+            payload = {
+                "exclude_archived": True,
+                "limit": 200,
+                "types": "public_channel,private_channel",
+            }
+            if cursor:
+                payload["cursor"] = cursor
+
+            response = yield self._call_slack_api("conversations.list", payload)
+            if response is None:
+                return channel
+
+            for conversation in response.get("channels", []):
+                name = conversation.get("name")
+                chan_id = conversation.get("id")
+                if not name or not chan_id:
+                    continue
+                self._channel_name_cache[name] = chan_id
+                if name == channel_name:
+                    return chan_id
+
+            cursor = ((response.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                break
+
+        logger.error(
+            "Unable to resolve Slack channel '{channel}' to an ID; using provided value",
+            channel=channel,
+        )
+        return channel
+
     @defer.inlineCallbacks
     def _estimate_eta_seconds(self, build, runtime_state, elapsed):
         builderid = runtime_state.get("builderid")
@@ -757,6 +811,9 @@ class SlackStatusPush(ReporterBase):
 
         try:
             if self.use_web_api:
+                resolved_channel = yield self._resolve_channel_id(postData.get("channel") or self.channel)
+                if resolved_channel:
+                    postData["channel"] = resolved_channel
                 message_ref = yield self._get_message_ref(buildid)
                 if message_ref is None:
                     logger.info("posting to Slack Web API chat.postMessage")
