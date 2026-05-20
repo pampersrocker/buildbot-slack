@@ -1045,7 +1045,21 @@ class SlackStatusPush(ReporterBase):
     def _build_progress_text(self, build, runtime_state):
         total_steps = yield self._estimate_total_steps(build, runtime_state)
         finished_steps = len(runtime_state.get("finished_steps", []))
-        progress_ratio = min(float(finished_steps) / float(total_steps), 1.0)
+        step_ratio = min(float(finished_steps) / float(total_steps), 1.0)
+
+        now = time.time()
+        start_time = self._coerce_timestamp(runtime_state.get("start_time", now), default=now)
+        if start_time is None:
+            start_time = now
+        elapsed_seconds = max(now - start_time, 0.0)
+        eta_seconds = yield self._estimate_eta_seconds(build, runtime_state, elapsed_seconds)
+
+        if eta_seconds is not None and elapsed_seconds > 0:
+            time_ratio = min(elapsed_seconds / (elapsed_seconds + float(eta_seconds) + 0.001), 1.0)
+            progress_ratio = min(step_ratio, time_ratio)
+        else:
+            progress_ratio = step_ratio
+
         done_blocks = int(progress_ratio * self.progress_bar_width)
         pending_blocks = self.progress_bar_width - done_blocks
         progress_bar = "[{done}{pending}] {pct:3.0f}%".format(
@@ -1054,12 +1068,6 @@ class SlackStatusPush(ReporterBase):
             pct=progress_ratio * 100.0,
         )
 
-        now = time.time()
-        start_time = self._coerce_timestamp(runtime_state.get("start_time", now), default=now)
-        if start_time is None:
-            start_time = now
-        elapsed_seconds = max(now - start_time, 0.0)
-        eta_seconds = yield self._estimate_eta_seconds(build, runtime_state, elapsed_seconds)
         current_step = runtime_state.get("current_step") or "waiting"
         builder_name = yield self._get_builder_name(build, runtime_state)
         build_label = "#{buildid}".format(buildid=build.get("buildid", "?"))
