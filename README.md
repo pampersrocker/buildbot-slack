@@ -47,13 +47,9 @@ c['services'].append(reporters.SlackStatusPush(
 
 To ensure the bot functions correctly in Bot API mode, the following Slack API scopes must be granted:
 
-1. **`channels:read`**
-   - Allows the bot to list public channels and resolve their names to IDs.
-2. **`groups:read`**
-   - Allows the bot to list private channels (if the bot is a member) and resolve their names to IDs.
-3. **`chat:write`**
+1. **`chat:write`**
    - Enables the bot to send messages to public or private channels.
-4. **`files:write`** *(required only when `failure_thread_upload_logs=True`)*
+2. **`files:write`** *(required only when `failure_thread_upload_logs=True`)*
    - Allows the bot to upload log files as attachments to the failure thread.
 
 Ensure these scopes are included in the bot's OAuth configuration in Slack.
@@ -82,7 +78,6 @@ In this mode:
 - Build start creates a message.
 - Step events update the same message with progress and ETA.
 - Build finish updates the same message to final status.
-- If `channel` is provided as a name (for example `#builds`), it is resolved to a channel ID using Slack `conversations.list` before posting.
 - For private channels, the bot must be a member of that channel to post.
 
 ### Failure thread
