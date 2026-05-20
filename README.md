@@ -53,6 +53,8 @@ To ensure the bot functions correctly in Bot API mode, the following Slack API s
    - Allows the bot to list private channels (if the bot is a member) and resolve their names to IDs.
 3. **`chat:write`**
    - Enables the bot to send messages to public or private channels.
+4. **`files:write`** *(required only when `failure_thread_upload_logs=True`)*
+   - Allows the bot to upload log files as attachments to the failure thread.
 
 Ensure these scopes are included in the bot's OAuth configuration in Slack.
 
@@ -83,6 +85,18 @@ In this mode:
 - If `channel` is provided as a name (for example `#builds`), it is resolved to a channel ID using Slack `conversations.list` before posting.
 - For private channels, the bot must be a member of that channel to post.
 
+### Failure thread
+
+When a build finishes with a failure or exception result, the bot posts a **threaded reply** under the build message containing details of every failed step:
+
+- Step name and state string (e.g. `exit code 1`).
+- Any URLs attached to the step.
+- The full `stdio`/`stderr` log uploaded as a `.txt` file attachment (requires the `files:write` scope).
+
+This keeps the channel tidy while making the full failure output one click away.
+
+Control this behaviour with the `failure_thread` and `failure_thread_upload_logs` options (see below).
+
 ### Options
 
 Common options:
@@ -94,10 +108,13 @@ Common options:
   username = None
   attachments = True
   throttle_interval_secs = 4
+  progress_refresh_secs = 15
   eta_history_limit = 10
   eta_match_properties = None
   eta_exclude_properties = None
   progress_bar_width = 12
+  failure_thread = True
+  failure_thread_upload_logs = True
 ```
 
 Message references for bot-mode updates are persisted in Buildbot DB state (`master.db.state`) by default.
@@ -108,6 +125,11 @@ ETA matching options:
 - `eta_exclude_properties`: optional deny-list of property names to ignore during matching.
 
 When `eta_match_properties` is not set, all available properties are considered except default excluded volatile keys and keys in `eta_exclude_properties`.
+
+Failure thread options:
+
+- `failure_thread` (default `True`): post a threaded reply with failed step details when a build fails. Set to `False` to disable entirely.
+- `failure_thread_upload_logs` (default `True`): upload the `stdio`/`stderr` log of each failed step as a file attachment in the failure thread. Requires the `files:write` Slack scope and the `treq` Python package. Set to `False` to post only the step summary text without log files.
 
 Webhook mode options:
 

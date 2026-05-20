@@ -135,6 +135,8 @@ class SlackStatusPush(ReporterBase):
         with_builder=True,
         with_repository=True,
         extra_properties=None,
+        failure_thread=True,
+        failure_thread_upload_logs=True,
         **kwargs,
     ):
         self.debug = debug
@@ -156,6 +158,8 @@ class SlackStatusPush(ReporterBase):
         self.with_builder = with_builder
         self.with_repository = with_repository
         self.extra_properties = extra_properties
+        self.failure_thread = bool(failure_thread)
+        self.failure_thread_upload_logs = bool(failure_thread_upload_logs)
         self.use_web_api = bool(use_web_api)
         self.slack_token = slack_token
         self.api_base = api_base
@@ -1181,6 +1185,154 @@ class SlackStatusPush(ReporterBase):
             self._last_step_update[state_key] = now
 
     @defer.inlineCallbacks
+    def _post_failure_thread_message(self, build, message_ref):
+        """Post a threaded reply with details of any failed steps, uploading logs as files."""
+        buildid = build.get("buildid")
+        try:
+            steps = yield self.master.data.get(("builds", buildid, "steps"))
+        except Exception as exc:
+            logger.warn("Unable to fetch steps for failure thread (build {buildid}): {error}", buildid=buildid, error=exc)
+            return
+
+        if not steps:
+            return
+
+        # Failure=2, Exception=4 — skip SUCCESS(0), WARNINGS(1), SKIPPED(3), RETRY(5), CANCELLED(6)
+        failed_steps = [s for s in steps if s.get("results") in (2, 4)]
+        if not failed_steps:
+            return
+
+        lines = [":x: *Failed step details*"]
+
+        for step in failed_steps:
+            step_name = step.get("name") or "unknown"
+            state_string = step.get("state_string") or ""
+            lines.append("")
+            lines.append("*Step: {name}*".format(name=step_name))
+            if state_string:
+                lines.append("State: {state}".format(state=state_string))
+
+            step_urls = step.get("urls") or []
+            if step_urls:
+                url_parts = []
+                for u in step_urls:
+                    label = u.get("name") or "link"
+                    href = u.get("url") or ""
+                    if href:
+                        url_parts.append("<{href}|{label}>".format(href=href, label=label))
+                if url_parts:
+                    lines.append("Links: " + "  ".join(url_parts))
+
+        # Post the summary text first so the file(s) attach underneath it.
+        summary_text = "\n".join(lines)
+        summary_payload = {
+            "channel": message_ref["channel"],
+            "thread_ts": message_ref["ts"],
+            "text": summary_text,
+        }
+        try:
+            yield self._call_slack_api("chat.postMessage", summary_payload)
+        except Exception as exc:
+            logger.warn("Unable to post failure thread for build {buildid}: {error}", buildid=buildid, error=exc)
+            return
+
+        # Upload a log file for each failed step.
+        if not self.failure_thread_upload_logs:
+            return
+        for step in failed_steps:
+            step_name = step.get("name") or "unknown"
+            stepid = step.get("stepid")
+            if stepid is None:
+                continue
+            try:
+                logs = yield self.master.data.get(("steps", stepid, "logs"))
+            except Exception:
+                continue
+            for log in (logs or []):
+                log_name = (log.get("name") or "").lower()
+                if log_name not in ("stdio", "stderr", "output"):
+                    continue
+                logid = log.get("logid")
+                if not logid:
+                    continue
+                try:
+                    contents = yield self.master.data.get(("logs", logid, "contents"))
+                except Exception:
+                    continue
+                raw = (contents or {}).get("content", "") if isinstance(contents, dict) else ""
+                if not raw:
+                    continue
+                # Strip Buildbot per-line type prefix (o/e/h/i/s).
+                clean_lines = []
+                for log_line in raw.splitlines():
+                    if log_line and log_line[0] in ("o", "e", "h", "i", "s"):
+                        clean_lines.append(log_line[1:])
+                    else:
+                        clean_lines.append(log_line)
+                log_content = "\n".join(clean_lines)
+                safe_name = step_name.replace("/", "_").replace(" ", "_")
+                filename = "build{buildid}_{step}_{log}.txt".format(
+                    buildid=buildid, step=safe_name, log=log_name
+                )
+                yield self._upload_log_file_to_slack(
+                    filename=filename,
+                    content=log_content,
+                    channel=message_ref["channel"],
+                    thread_ts=message_ref["ts"],
+                )
+                break  # one log per step is enough
+
+    @defer.inlineCallbacks
+    def _upload_log_file_to_slack(self, filename, content, channel, thread_ts):
+        """Upload a text file to a Slack thread using the v2 upload API."""
+        try:
+            import treq as _treq
+        except ImportError:
+            logger.warn("treq is not available; cannot upload log file to Slack")
+            return
+
+        content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+
+        # Step 1: obtain a pre-signed upload URL.
+        url_response = yield self._call_slack_api("files.getUploadURLExternal", {
+            "filename": filename,
+            "length": len(content_bytes),
+        })
+        if url_response is None:
+            return
+        upload_url = url_response.get("upload_url")
+        file_id = url_response.get("file_id")
+        if not upload_url or not file_id:
+            logger.warn("Slack did not return upload_url/file_id for {filename}", filename=filename)
+            return
+
+        # Step 2: PUT the file content to the pre-signed URL.
+        try:
+            upload_resp = yield _treq.put(
+                upload_url,
+                data=content_bytes,
+                headers={b"Content-Type": b"text/plain; charset=utf-8"},
+            )
+            if upload_resp.code not in (200, 204):
+                body = yield _treq.content(upload_resp)
+                logger.warn(
+                    "Log file upload failed ({code}): {body}",
+                    code=upload_resp.code,
+                    body=body,
+                )
+                return
+        except Exception as exc:
+            logger.warn("Log file upload PUT failed: {error}", error=exc)
+            return
+
+        # Step 3: finalise the upload and share it into the thread.
+        yield self._call_slack_api("files.completeUploadExternal", {
+            "files": [{"id": file_id}],
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+        })
+
+    @defer.inlineCallbacks
     def sendMessage(self, reports):
         # We only use the first report, even if multiple are passed
         report = reports[0]
@@ -1224,6 +1376,10 @@ class SlackStatusPush(ReporterBase):
                     self._ensure_periodic_progress_updates(buildid)
                 else:
                     self._stop_periodic_progress_updates(buildid)
+                    if self.failure_thread and build.get("results") in (2, 4):  # FAILURE or EXCEPTION
+                        final_ref = yield self._get_message_ref(buildid)
+                        if final_ref is not None:
+                            yield self._post_failure_thread_message(build, final_ref)
             else:
                 logger.info("posting to {url}", url=self.endpoint)
                 yield self._post_webhook_message(postData)
