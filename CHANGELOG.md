@@ -1,3 +1,12 @@
+version 0.3.0
+-------------
+
+- add Slack Bot API mode using `chat.postMessage` and `chat.update`
+- support one message per build with continuous step-based updates
+- add per-build progress bar, elapsed time, and ETA estimation
+- persist Slack message references in Buildbot DB state
+- keep incoming webhook mode for backward compatibility
+
 version 0.2.4
 -------------
 
