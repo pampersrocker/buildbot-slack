@@ -775,10 +775,9 @@ class SlackStatusPush(ReporterBase):
             return known_steps
 
         try:
-            history = yield self.master.db.builds.getBuilds(
+            history = (yield self.master.db.builds.getBuilds(
                 builderid=builderid,
-                limit=self.eta_history_limit,
-            )
+            ) or [])[:self.eta_history_limit]
 
             step_counts = []
             perfect_match_counts = []
@@ -836,8 +835,7 @@ class SlackStatusPush(ReporterBase):
             if candidate_counts:
                 estimated_total = max(int(round(statistics.median(candidate_counts))), 1)
                 runtime_state["estimated_total_steps"] = estimated_total
-                baseline_totals.append(estimated_total)
-                return max(baseline_totals)
+                return max(estimated_total, known_steps)
         except Exception as exc:
             logger.warn(
                 "Unable to estimate total step count for build {buildid}: {error}",
@@ -845,7 +843,7 @@ class SlackStatusPush(ReporterBase):
                 error=exc,
             )
 
-        return max(baseline_totals)
+        return known_steps
 
     @defer.inlineCallbacks
     def _estimate_factory_total_steps(self, build, runtime_state):
@@ -937,10 +935,9 @@ class SlackStatusPush(ReporterBase):
         buildid = build.get("buildid")
         if builderid is not None:
             try:
-                history = yield self.master.db.builds.getBuilds(
+                history = (yield self.master.db.builds.getBuilds(
                     builderid=builderid,
-                    limit=self.eta_history_limit,
-                )
+                ) or [])[:self.eta_history_limit]
                 durations = []
                 perfect_match_durations = []
                 best_match_durations = []
