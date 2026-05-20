@@ -682,27 +682,28 @@ class SlackStatusPush(ReporterBase):
         if self._api_http is None or not self.slack_token:
             logger.error("Slack Web API is not configured correctly")
             return None
+        api_path = path if path.startswith("/") else "/{path}".format(path=path)
         headers = {
             "Authorization": "Bearer {token}".format(token=self.slack_token),
             "Content-Type": "application/json; charset=utf-8",
         }
-        response = yield self._api_http.post(path, json=payload, headers=headers)
+        response = yield self._api_http.post(api_path, json=payload, headers=headers)
         content = yield response.content()
         if response.code != 200:
             logger.error(
                 "{code}: Slack API request failed at {path}: {content}",
                 code=response.code,
-                path=path,
+                path=api_path,
                 content=content,
             )
             return None
         try:
             data = json.loads(content.decode("utf-8")) if isinstance(content, bytes) else json.loads(content)
         except Exception as exc:
-            logger.error("Could not decode Slack API response for {path}: {error}", path=path, error=exc)
+            logger.error("Could not decode Slack API response for {path}: {error}", path=api_path, error=exc)
             return None
         if not data.get("ok"):
-            logger.error("Slack API {path} returned an error: {error}", path=path, error=data.get("error"))
+            logger.error("Slack API {path} returned an error: {error}", path=api_path, error=data.get("error"))
             return None
         return data
 
