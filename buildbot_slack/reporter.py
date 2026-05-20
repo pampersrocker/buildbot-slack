@@ -760,15 +760,15 @@ class SlackStatusPush(ReporterBase):
     def _estimate_total_steps(self, build, runtime_state):
         known_steps = max(len(runtime_state.get("known_steps", [])), 1)
         factory_total = yield self._estimate_factory_total_steps(build, runtime_state)
-        cached_total = runtime_state.get("estimated_total_steps")
-        baseline_totals = [known_steps]
-        if isinstance(factory_total, int) and factory_total > 0:
-            baseline_totals.append(factory_total)
-        if isinstance(cached_total, int) and cached_total > 0:
-            baseline_totals.append(cached_total)
 
-        if isinstance(factory_total, int) and factory_total > 0 and isinstance(cached_total, int) and cached_total > 0:
-            return max(baseline_totals)
+        # Factory count is the most authoritative — use it directly when available.
+        if isinstance(factory_total, int) and factory_total > 0:
+            # Still respect more steps seen live (e.g. dynamic steps added at runtime).
+            return max(factory_total, known_steps)
+
+        cached_total = runtime_state.get("estimated_total_steps")
+        if isinstance(cached_total, int) and cached_total > 0:
+            return max(cached_total, known_steps)
 
         builderid = runtime_state.get("builderid") or build.get("builderid")
         if builderid is None:
@@ -789,6 +789,11 @@ class SlackStatusPush(ReporterBase):
             for hist_build in history:
                 hist_buildid = hist_build.get("buildid")
                 if hist_buildid == build.get("buildid"):
+                    continue
+
+                # Only count steps from successful completed builds.
+                hist_results = hist_build.get("results")
+                if hist_results != 0:
                     continue
 
                 hist_full_build = yield self.master.data.get(("builds", hist_buildid))
@@ -945,8 +950,12 @@ class SlackStatusPush(ReporterBase):
                     hist_buildid = hist_build.get("buildid")
                     if hist_buildid == buildid:
                         continue
+                    # Only use successful completed builds for ETA.
+                    hist_results = hist_build.get("results")
+                    if hist_results != 0:
+                        continue
                     duration = self._extract_build_duration_seconds(hist_build)
-                    if duration is None:
+                    if duration is None or duration <= 0:
                         continue
                     durations.append(duration)
 
@@ -980,14 +989,37 @@ class SlackStatusPush(ReporterBase):
 
                 if candidate_durations:
                     median_duration = statistics.median(candidate_durations)
-                    duration_eta = max(int(median_duration - elapsed), 0)
 
                     if finished_steps > 0 and total_steps > finished_steps:
-                        projected_total = (elapsed / float(finished_steps)) * float(total_steps)
-                        step_eta = max(int(projected_total - elapsed), 0)
-                        return max(duration_eta, step_eta)
+                        # Step-based projection: scale remaining time by fraction of steps left.
+                        fraction_done = float(finished_steps) / float(total_steps)
+                        if fraction_done > 0:
+                            projected_total = elapsed / fraction_done
+                            step_eta = max(int(projected_total - elapsed), 0)
+                        else:
+                            step_eta = None
 
-                    return duration_eta
+                        if elapsed < median_duration:
+                            # Still within historical range: blend both models.
+                            duration_eta = int(median_duration - elapsed)
+                            if step_eta is not None:
+                                return max(duration_eta, step_eta)
+                            return duration_eta
+                        else:
+                            # Build is running longer than median — trust step projection.
+                            if step_eta is not None:
+                                return step_eta
+                            # Fallback: extrapolate median proportionally.
+                            remaining_fraction = max(1.0 - float(finished_steps) / float(total_steps), 0.0)
+                            return max(int(median_duration * remaining_fraction), 0)
+
+                    # No step information: use duration minus elapsed, but extrapolate
+                    # proportionally if we have overrun the median.
+                    if elapsed < median_duration:
+                        return int(median_duration - elapsed)
+                    # Overrun: show a small proportional estimate, not 0.
+                    overrun_factor = elapsed / median_duration
+                    return max(int(median_duration * (overrun_factor - 1.0) * 0.5), 10)
             except Exception as exc:
                 logger.warn("Unable to compute historical ETA for build {buildid}: {error}", buildid=buildid, error=exc)
 
