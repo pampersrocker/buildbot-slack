@@ -101,6 +101,7 @@ Common options:
   slack_token = None
   channel = None
   username = None
+  header_text = None   # text placed at the top of every status message
   attachments = True
   throttle_interval_secs = 4
   progress_refresh_secs = 15

@@ -70,8 +70,14 @@ class SlackStatusPush(ReporterBase):
         username=None,
         slack_token=None,
         use_web_api=False,
+        header_text=None,
         **kwargs,
     ):
+        if header_text and not isinstance(header_text, str):
+            logger.warn(
+                "[SlackStatusPush] header_text must be a string, got '{typename}' instead",
+                typename=type(header_text).__name__,
+            )
         if endpoint is not None and not isinstance(endpoint, str):
             logger.warn(
                 "[SlackStatusPush] endpoint should be a string, got '{typename}' instead",
@@ -138,8 +144,10 @@ class SlackStatusPush(ReporterBase):
         failure_thread=True,
         failure_thread_upload_logs=True,
         show_step_progress=True,
+        header_text=None,
         **kwargs,
     ):
+        self.header_text = header_text
         self.debug = debug
         self.verify = verify
 
@@ -345,6 +353,8 @@ class SlackStatusPush(ReporterBase):
                 postData["attachments"] = attachments
         else:
             text += "\n here: " + build["url"]
+        if self.header_text:
+            text = "{header}\n{text}".format(header=self.header_text, text=text)
         postData["text"] = text
 
         if self.channel:
@@ -1136,6 +1146,8 @@ class SlackStatusPush(ReporterBase):
 
         if build.get("url"):
             lines.append("Details: {url}".format(url=build["url"]))
+        if self.header_text:
+            lines.insert(0, self.header_text)
         return "\n".join(lines)
 
     def _should_skip_build(self, build):
