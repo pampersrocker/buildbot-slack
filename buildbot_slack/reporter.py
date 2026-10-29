@@ -24,7 +24,7 @@ logger = Logger()
 STATUS_EMOJIS = {
     "running": ":hourglass_flowing_sand:",
     "success": ":white_check_mark:",
-    "warnings": ":meow_wow:",
+    "warnings": ":warning:",
     "failure": ":x:",
     "skipped": ":hand:",
     "exception": ":skull:",
@@ -144,10 +144,14 @@ class SlackStatusPush(ReporterBase):
         failure_thread=True,
         failure_thread_upload_logs=True,
         show_step_progress=True,
+        icon_emoji=None,
+        icon_url=None,
         header_text=None,
         **kwargs,
     ):
         self.header_text = header_text
+        self.icon_emoji = icon_emoji
+        self.icon_url = icon_url
         self.debug = debug
         self.verify = verify
 
@@ -362,6 +366,12 @@ class SlackStatusPush(ReporterBase):
 
         if self.username:
             postData["username"] = self.username
+
+        if self.icon_emoji:
+            postData["icon_emoji"] = self.icon_emoji
+
+        if self.icon_url:
+            postData["icon_url"] = self.icon_url
 
         extra_params = yield self.getExtraParams(build)
         postData.update(extra_params)
@@ -1346,6 +1356,12 @@ class SlackStatusPush(ReporterBase):
             "thread_ts": message_ref["ts"],
             "text": summary_text,
         }
+        if self.username:
+            summary_payload["username"] = self.username
+        if self.icon_emoji:
+            summary_payload["icon_emoji"] = self.icon_emoji
+        if self.icon_url:
+            summary_payload["icon_url"] = self.icon_url
         try:
             yield self._call_slack_api("chat.postMessage", summary_payload)
         except Exception as exc:
